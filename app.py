@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-plt.style.use('ggplot')
 from scipy.interpolate import interp1d
 
 # --- Configuration ---
@@ -12,23 +11,46 @@ st.set_page_config(page_title="CPPopt Analyzer", layout="wide")
 
 def parse_timestamps(timestamp_series):
     """
-    Parses 'MM:SS.f' timestamps and unwraps them to handle hour rollovers.
-    Returns a series of continuous seconds.
+    Parses timestamps in various formats (MM:SS, HH:MM:SS, Date Time)
+    and unwraps them to handle hour/day rollovers.
     """
     def to_seconds(t_str):
         try:
             if pd.isna(t_str): return np.nan
-            parts = str(t_str).split(':')
-            if len(parts) == 2:
+            t_str = str(t_str).strip()
+            
+            # If there's a date and time (e.g. "2023-10-24 14:30:00"), just take the time part
+            if ' ' in t_str:
+                t_str = t_str.split(' ')[-1]
+                
+            parts = t_str.split(':')
+            
+            # HH:MM:SS
+            if len(parts) == 3:
+                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+            # MM:SS
+            elif len(parts) == 2:
                 return float(parts[0]) * 60 + float(parts[1])
+            # Already in seconds?
+            elif len(parts) == 1:
+                return float(parts[0])
             return np.nan
         except:
             return np.nan
 
     seconds_raw = timestamp_series.apply(to_seconds)
+    
+    # Unwrap (detect rollover like going from 23:59:59 to 00:00:00)
     diffs = seconds_raw.diff()
+    # If time jumps backwards by a large amount (e.g., > 1000s), assume a rollover
     wraps = (diffs < -1000).cumsum().fillna(0)
-    seconds_unwrapped = seconds_raw + (wraps * 3600)
+    
+    # We add 3600 seconds if the data is MM:SS and wrapped the hour. 
+    # If it's HH:MM:SS, it wraps the day (86400 seconds).
+    # We'll dynamically guess the wrap size based on the max value before wrap.
+    wrap_size = 3600 if seconds_raw.max() <= 3605 else 86400
+    
+    seconds_unwrapped = seconds_raw + (wraps * wrap_size)
     
     return seconds_unwrapped
 
@@ -39,14 +61,12 @@ def format_duration(seconds):
     return f"{hours} hr {minutes} min"
 
 def calculate_cppopt(df_prx, df_cpp, bin_size=5, min_bin_count=10):
-    # Sort and interpolate
     df_prx = df_prx.sort_values('time_sec')
     df_cpp = df_cpp.sort_values('time_sec')
     
     f_cpp = interp1d(df_cpp['time_sec'], df_cpp['CPP'], kind='linear', fill_value="extrapolate")
     df_prx['aligned_cpp'] = f_cpp(df_prx['time_sec'])
 
-    # Binning
     min_c = int(df_prx['aligned_cpp'].min())
     max_c = int(df_prx['aligned_cpp'].max())
     
@@ -56,10 +76,8 @@ def calculate_cppopt(df_prx, df_cpp, bin_size=5, min_bin_count=10):
     bins = np.arange(min_c, max_c + bin_size, bin_size)
     df_prx['cpp_bin'] = pd.cut(df_prx['aligned_cpp'], bins=bins)
 
-    # Calculate global average Prx (weighted by time/points)
     global_avg_prx = df_prx['prx'].mean()
 
-    # Calculate stats per bin
     stats = df_prx.groupby('cpp_bin', observed=True)['prx'].agg(['mean', 'count', 'sem']).reset_index()
     stats['cpp_mid'] = stats['cpp_bin'].apply(lambda x: x.mid).astype(float)
     
@@ -78,7 +96,7 @@ def calculate_cppopt(df_prx, df_cpp, bin_size=5, min_bin_count=10):
 # --- Main App Interface ---
 
 st.title("🧠 CPPopt Analyzer")
-st.markdown("Upload your separate **Prx** and **CPP** CSV files below to generate the optimal CPP curve.")
+st.markdown("Upload your separate **Prx** and **CPP** CSV files below.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -93,7 +111,6 @@ if prx_file and cpp_file:
         df_cpp_raw = pd.read_csv(cpp_file)
         
         with st.spinner('Processing data...'):
-            # Column detection
             prx_cols = [c for c in df_prx_raw.columns if 'prx' in c.lower()]
             prx_time_cols = [c for c in df_prx_raw.columns if 'time' in c.lower()]
             cpp_cols = [c for c in df_cpp_raw.columns if 'cpp' in c.lower()]
@@ -106,20 +123,27 @@ if prx_file and cpp_file:
             df_prx = df_prx_raw.rename(columns={prx_time_cols[0]: 'timestamp', prx_cols[0]: 'prx'})
             df_cpp = df_cpp_raw.rename(columns={cpp_time_cols[0]: 'timestamp', cpp_cols[0]: 'CPP'})
             
+            # Show the user what the raw timestamps look like to help debug
+            with st.expander("Show Timestamp Debugging Info"):
+                st.write("First 3 Prx Timestamps:", df_prx['timestamp'].head(3).tolist())
+                st.write("First 3 CPP Timestamps:", df_cpp['timestamp'].head(3).tolist())
+
             df_prx['time_sec'] = parse_timestamps(df_prx['timestamp'])
             df_cpp['time_sec'] = parse_timestamps(df_cpp['timestamp'])
             
             df_prx = df_prx.dropna(subset=['time_sec', 'prx'])
             df_cpp = df_cpp.dropna(subset=['time_sec', 'CPP'])
             
-            # Calculate
+            # --- SAFETY CHECK ---
+            if len(df_prx) == 0 or len(df_cpp) == 0:
+                st.error("🚨 Error: The app couldn't understand the timestamp format, resulting in 0 data points.")
+                st.info("Check the 'Timestamp Debugging Info' above. What do the raw timestamps look like? (e.g. 14:30:00, or something else?)")
+                st.stop()
+
             stats_df, cpp_opt, min_prx, global_avg_prx = calculate_cppopt(df_prx, df_cpp)
             
-            # Duration Calculation
             total_duration_sec = df_prx['time_sec'].max() - df_prx['time_sec'].min()
             
-        # --- Updated Results Display ---
-        
         # Row 1: Key Metrics
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Optimal CPP", f"{cpp_opt} mmHg" if not pd.isna(cpp_opt) else "N/A")
@@ -138,7 +162,6 @@ if prx_file and cpp_file:
             if not pd.isna(cpp_opt):
                 ax.plot(cpp_opt, min_prx, 'rx', markersize=12, markeredgewidth=3, label=f'Optimal CPP: {cpp_opt}')
             
-            # Highlight average Prx
             ax.axhline(global_avg_prx, color='orange', linestyle=':', linewidth=1.5, label=f'Avg Prx ({global_avg_prx:.2f})')
             ax.axhline(0.2, color='green', linestyle='--', alpha=0.5, label='Threshold (0.2)')
             ax.axhline(0, color='gray', linestyle='-', linewidth=0.8)
@@ -150,12 +173,11 @@ if prx_file and cpp_file:
             
             st.pyplot(fig)
             
-            # Download
             csv = stats_df.to_csv(index=False).encode('utf-8')
             st.download_button("Download Analysis Data", data=csv, file_name="cppopt_analysis.csv", mime="text/csv")
             
         else:
-            st.warning("Not enough data to generate a curve.")
+            st.warning("Not enough overlapping data to generate a curve.")
             
     except Exception as e:
-        st.error(f"An error occurred: {e}")
+        st.error(f"An unexpected error occurred: {e}")
